@@ -45,20 +45,15 @@ static inline bool add_would_overflow_u32(size_t a, size_t b) {
 constexpr size_t BLOCK_SIZE = 512;
 constexpr size_t BCPL_STRING_MAX = 30;
 constexpr size_t HASH_TABLE_SIZE = 72;
-constexpr size_t MAX_BLOCKS = 1760;  // Standard DD disk
 
 // Block types
 constexpr int32_t T_HEADER = 2;
 constexpr int32_t T_DATA = 8;
-constexpr int32_t T_LIST = 16;
-constexpr int32_t T_SHORT = -3;
-constexpr int32_t T_LONG = -4;
 constexpr int32_t ST_ROOT = 1;
 constexpr int32_t ST_DIR = 2;
 constexpr int32_t ST_FILE = -3;
 
 // DOS types
-constexpr uint32_t DOS_OFS = 0x444F5300;
 constexpr uint32_t DOS_FFS = 0x444F5301;
 constexpr uint32_t DOS_FFS_INTL = 0x444F5303;
 constexpr uint32_t DOS_FFS_DC = 0x444F5305;
@@ -989,7 +984,7 @@ public:
         return bytes_written;
     }
     
-    int create_file(const std::string& path, mode_t mode) {
+    int create_file(const std::string& path, mode_t) {
         std::lock_guard<std::mutex> lock(fs_mutex_);
         if (read_only_) return -EROFS;
         
@@ -1209,7 +1204,7 @@ public:
         return 0;
     }
     
-    int create_directory(const std::string& path, mode_t mode) {
+    int create_directory(const std::string& path, mode_t) {
         std::lock_guard<std::mutex> lock(fs_mutex_);
         if (read_only_) return -EROFS;
         
@@ -1395,7 +1390,7 @@ private:
         }
     }
     
-    void remove_from_directory(uint32_t dir_block, uint32_t file_block, const std::string& name) {
+    void remove_from_directory(uint32_t dir_block, uint32_t file_block, const std::string&) {
         
         if (dir_block == root_block_num_) {
             auto* root = get_block_writable<RootBlock>(dir_block);
@@ -1741,7 +1736,7 @@ static int flush(const char*, struct fuse_file_info*) {
 
 // Add mknod shim for maximum tool compatibility
 // Some callers do mknod + open instead of create
-static int mknod(const char* path, mode_t mode, dev_t rdev) {
+static int mknod(const char* path, mode_t mode, dev_t) {
     if (!g_adf_image) return -EIO;
     
     // Only support regular files (S_IFREG)
@@ -1752,19 +1747,19 @@ static int mknod(const char* path, mode_t mode, dev_t rdev) {
 }
 
 // Add missing permission operations
-static int chmod(const char* path, mode_t mode) {
+static int chmod(const char*, mode_t) {
     // Amiga filesystems don't support Unix permissions
     // Just return success to satisfy tools like cp
     return 0;
 }
 
-static int chown(const char* path, uid_t uid, gid_t gid) {
+static int chown(const char*, uid_t, gid_t) {
     // Amiga filesystems don't support Unix ownership
     // Just return success to satisfy tools
     return 0;
 }
 
-static int utimens(const char* path, const struct timespec tv[2]) {
+static int utimens(const char*, const struct timespec[2]) {
     // For now, ignore timestamp updates from external tools
     // TODO: Could update Amiga timestamps here
     return 0;

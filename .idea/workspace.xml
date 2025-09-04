@@ -24,6 +24,7 @@
     <list default="true" id="7b7de78f-de09-4e14-ae4e-163689b44e02" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/CMakeLists.txt" beforeDir="false" afterPath="$PROJECT_DIR$/CMakeLists.txt" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/amiga-fuse.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/amiga-fuse.cpp" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/test_debug.adf" beforeDir="false" />
@@ -131,7 +132,7 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1756896541974</updated>
-      <workItem from="1756896543066" duration="9905000" />
+      <workItem from="1756896543066" duration="11443000" />
     </task>
     <servers />
   </component>

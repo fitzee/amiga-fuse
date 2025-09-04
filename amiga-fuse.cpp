@@ -11,7 +11,9 @@
 #define DBG(stmt) do { if (ADF_DEBUG) { stmt; } } while(0)
 
 #ifdef __APPLE__
+#ifndef typeof
 #define typeof __typeof__
+#endif
 #endif
 
 #include <fuse.h>
@@ -38,6 +40,7 @@
 #include <vector>
 #include <set>
 #include <limits>
+// #include <csignal>  // not needed if we remove custom handler
 
 namespace amiga_fuse {
 
@@ -304,6 +307,15 @@ public:
         return read_only_;
     }
     
+    size_t total_blocks() const { 
+        return file_size_ / BLOCK_SIZE; 
+    }
+    
+    size_t free_blocks_count() const {
+        std::lock_guard<std::mutex> lock(fs_mutex_);
+        return free_blocks_.size();
+    }
+    
     template<typename T>
     const T* get_block(uint32_t block_num) const {
         if (!is_valid() || (block_num + 1ull) * BLOCK_SIZE > file_size_) {
@@ -364,16 +376,30 @@ public:
             // Not a valid DOS disk, but try standard DD geometry anyway
         }
         
-        const auto* root = get_block<RootBlock>(root_block_num_);
+        auto* root = get_block<RootBlock>(root_block_num_);
         if (!root) return false;
         
         // Verify root block checksum
         uint32_t stored_checksum = endian::from_big_endian(root->checksum);
         uint32_t calculated_checksum = calculate_checksum(root, 5);  // RootBlock checksum at offset 5
         if (stored_checksum != calculated_checksum) {
-            std::cerr << "Warning: Root block checksum mismatch at block " << root_block_num_ 
-                      << " (expected: " << std::hex << calculated_checksum 
-                      << ", found: " << stored_checksum << ")" << std::dec << std::endl;
+            // Try a small window around the midpoint (helps with odd geometries)
+            for (int delta = -64; delta <= 64; ++delta) {
+                if (delta == 0) continue;
+                uint32_t cand = root_block_num_ + delta;
+                auto* r = get_block<RootBlock>(cand);
+                if (!r) continue;
+                if (endian::from_big_endian(r->type) == static_cast<uint32_t>(T_HEADER)) {
+                    auto sum = calculate_checksum(r, 5);
+                    int32_t st = endian::from_big_endian(r->sec_type);
+                    if (sum == endian::from_big_endian(r->checksum) &&
+                        (st == ST_ROOT || st == 0)) {
+                        root = r;
+                        root_block_num_ = cand;
+                        break;
+                    }
+                }
+            }
         }
         
         uint32_t root_type = endian::from_big_endian(root->type);
@@ -1770,9 +1796,31 @@ static int chown(const char*, uid_t, gid_t) {
     return 0;
 }
 
-static int utimens(const char*, const struct timespec[2]) {
-    // For now, ignore timestamp updates from external tools
-    // TODO: Could update Amiga timestamps here
+static int utimens(const char* path, const struct timespec tv[2]) {
+    if (!g_adf_image) return -EIO;
+    
+    // For production: could update Amiga file timestamps here
+    // tv[0] = access time, tv[1] = modification time
+    // Currently Amiga filesystem doesn't track access time
+    
+    return 0; // Success - satisfies touch, cp -p, etc.
+}
+
+static int statfs(const char*, struct statvfs* stbuf) {
+    if (!g_adf_image) return -EIO;
+    
+    std::memset(stbuf, 0, sizeof(*stbuf));
+    stbuf->f_bsize  = amiga_fuse::BLOCK_SIZE;
+    stbuf->f_frsize = amiga_fuse::BLOCK_SIZE;
+    const auto total = g_adf_image->total_blocks();
+    const auto free  = g_adf_image->free_blocks_count();
+    stbuf->f_blocks = static_cast<fsblkcnt_t>(total);
+    stbuf->f_bfree  = static_cast<fsblkcnt_t>(free);
+    stbuf->f_bavail = static_cast<fsblkcnt_t>(free);
+    // crude but consistent with a flat FS without inode accounting
+    stbuf->f_files  = static_cast<fsfilcnt_t>(total);
+    stbuf->f_ffree  = static_cast<fsfilcnt_t>(free);
+    stbuf->f_namemax = amiga_fuse::BCPL_STRING_MAX; // 30
     return 0;
 }
 
@@ -1798,21 +1846,32 @@ void initialize_fuse_operations() {
     amiga_fuse_operations.chmod = fuse_ops::chmod;
     amiga_fuse_operations.chown = fuse_ops::chown;
     amiga_fuse_operations.utimens = fuse_ops::utimens;
+    amiga_fuse_operations.statfs = fuse_ops::statfs;
 }
 
 } // namespace amiga_fuse
+
+// Rely on FUSE's own signal handling; we sync after fuse_main returns.
 
 int main(int argc, char* argv[]) {
     using namespace amiga_fuse;
     
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " <adf_file> <mount_point> [fuse_options]\n";
+        std::cerr << "  Note: ADF filesystems require write access for proper operation\n";
         return 1;
     }
     
+    // ADF filesystems require write access even for reading operations
+    // due to internal filesystem bookkeeping (checksums, metadata, etc.)
+    bool enable_write = true;
+    
+    // Rely on FUSE's own signal handling; we sync after fuse_main returns.
+    
     g_adf_image = std::make_unique<AdfImage>(argv[1]);
-    if (!g_adf_image->open(true)) {  // true = try to open with write support
-        std::cerr << "Failed to open ADF file: " << argv[1] << "\n";
+    if (!g_adf_image->open(enable_write)) {  // Pass the write flag
+        std::cerr << "Error: Cannot open ADF file: " << argv[1] << "\n";
+        std::cerr << "Check: File exists, is readable, and is a valid ADF image.\n";
         return 1;
     }
     
@@ -1823,7 +1882,7 @@ int main(int argc, char* argv[]) {
     if (g_adf_image->is_read_only()) {
         std::cout << " [READ-ONLY]";
     } else {
-        std::cout << " [READ-WRITE]";
+        std::cout << " [READ-WRITE - use with caution!]";
     }
     std::cout << "\n";
     
@@ -1831,9 +1890,17 @@ int main(int argc, char* argv[]) {
     initialize_fuse_operations();
     
     // Adjust arguments for FUSE - safely shift arguments
-    std::memmove(argv + 1, argv + 2, (argc - 1) * sizeof(char*));
+    std::memmove(argv + 1, argv + 2, (argc - 2) * sizeof(char*));
     --argc;
     argv[argc] = nullptr; // now argv = [prog, mount_point, ...fuse_options]
     
-    return fuse_main(argc, argv, &amiga_fuse_operations, nullptr);
+    int result = fuse_main(argc, argv, &amiga_fuse_operations, nullptr);
+    
+    // Clean shutdown
+    if (g_adf_image) {
+        g_adf_image->sync_to_disk();
+        g_adf_image.reset();
+    }
+    
+    return result;
 }

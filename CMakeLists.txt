@@ -32,6 +32,7 @@ add_executable(amiga-fuse amiga-fuse.cpp)
 # Set compiler flags for optimization
 target_compile_options(amiga-fuse PRIVATE
     -Os                    # Optimize for size
+    -fPIC                  # Position-independent code
     -DNDEBUG              # Remove debug code
     -ffunction-sections   # Separate functions for dead code elimination
     -fdata-sections       # Separate data for dead code elimination

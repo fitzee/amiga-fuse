@@ -5,6 +5,11 @@
 
 #define FUSE_USE_VERSION 26
 
+#ifndef ADF_DEBUG
+#define ADF_DEBUG 0
+#endif
+#define DBG(stmt) do { if (ADF_DEBUG) { stmt; } } while(0)
+
 #ifdef __APPLE__
 #define typeof __typeof__
 #endif
@@ -557,7 +562,7 @@ public:
     
     void update_bitmap_for_block(uint32_t block, bool is_free) {
         uint32_t total_blocks = static_cast<uint32_t>(file_size_ / BLOCK_SIZE);
-        if (block >= total_blocks) return;
+        if (block >= total_blocks || block < 2) return; // Guard free/boot blocks
         
         // Find which bitmap block this belongs to
         uint32_t bitmap_index = block / 4064;
@@ -645,7 +650,7 @@ public:
             while (block_num != 0) {
                 // Skip if we've already seen this block
                 if (seen_blocks.count(block_num)) {
-                    std::cerr << "DEBUG: Skipping duplicate block " << block_num << std::endl;
+                    DBG(std::cerr << "DEBUG: Skipping duplicate block " << block_num << std::endl);
                     break; // Don't continue chain - likely circular reference
                 }
                 seen_blocks.insert(block_num);
@@ -715,7 +720,7 @@ public:
         if (!entries) return std::nullopt;
         
         for (const auto& entry : *entries) {
-            if (entry.name == entry_name) {
+            if (equals_icase_ascii(entry.name, entry_name)) {
                 return entry;
             }
         }
@@ -1047,22 +1052,22 @@ public:
     int delete_file(const std::string& path) {
         std::lock_guard<std::mutex> lock(fs_mutex_);
         if (read_only_) {
-            std::cerr << "DEBUG: delete_file failed - filesystem is read-only" << std::endl;
+            DBG(std::cerr << "DEBUG: delete_file failed - filesystem is read-only" << std::endl);
             return -EROFS;
         }
         
         auto entry = get_entry_unsafe(path);
         if (!entry) {
-            std::cerr << "DEBUG: delete_file failed - file not found: " << path << std::endl;
+            DBG(std::cerr << "DEBUG: delete_file failed - file not found: " << path << std::endl);
             return -ENOENT;
         }
         if (entry->is_directory) {
-            std::cerr << "DEBUG: delete_file failed - path is directory: " << path << std::endl;
+            DBG(std::cerr << "DEBUG: delete_file failed - path is directory: " << path << std::endl);
             return -EISDIR;
         }
         
-        std::cerr << "DEBUG: delete_file proceeding with file: " << path 
-                  << " (block=" << entry->block_num << ")" << std::endl;
+        DBG(std::cerr << "DEBUG: delete_file proceeding with file: " << path 
+                  << " (block=" << entry->block_num << ")" << std::endl);
         
         size_t last_slash = path.find_last_of('/');
         std::string parent_path = (last_slash == 0) ? "/" : path.substr(0, last_slash);
@@ -1071,6 +1076,12 @@ public:
         // Remove from parent directory
         
         remove_from_directory(parent_block, entry->block_num, entry->name);
+        
+        // Unlink hygiene: zero the file's hash_chain before freeing
+        if (auto* fb = get_block_writable<FileBlock>(entry->block_num)) {
+            fb->hash_chain = endian::to_big_endian(0u);
+            update_checksum(fb);
+        }
         
         // Validate root block integrity after directory modification
         if (parent_block == root_block_num_) {
@@ -1348,16 +1359,16 @@ private:
     void add_to_directory(uint32_t dir_block, uint32_t file_block, const std::string& name) {
         uint32_t hash = hash_name(name);
         
-        std::cerr << "DEBUG: add_to_directory: name='" << name << "' hash=" << hash 
-                  << " file_block=" << file_block << " dir_block=" << dir_block << std::endl;
+        DBG(std::cerr << "DEBUG: add_to_directory: name='" << name << "' hash=" << hash 
+                  << " file_block=" << file_block << " dir_block=" << dir_block << std::endl);
         
         if (dir_block == root_block_num_) {
             auto* root = get_block_writable<RootBlock>(dir_block);
             if (!root) return;
             
             uint32_t existing = endian::from_big_endian(root->hash_table[hash]);
-            std::cerr << "DEBUG: root hash_table[" << hash << "] was " << existing 
-                      << ", setting to " << file_block << std::endl;
+            DBG(std::cerr << "DEBUG: root hash_table[" << hash << "] was " << existing 
+                      << ", setting to " << file_block << std::endl);
                       
             root->hash_table[hash] = endian::to_big_endian(file_block);
             
@@ -1365,7 +1376,7 @@ private:
             auto* file = get_block_writable<FileBlock>(file_block);
             if (file) {
                 file->hash_chain = endian::to_big_endian(existing);
-                std::cerr << "DEBUG: Set file->hash_chain to " << existing << std::endl;
+                DBG(std::cerr << "DEBUG: Set file->hash_chain to " << existing << std::endl);
                 update_checksum(file);
             }
             
@@ -1648,7 +1659,7 @@ static int write(const char* path, const char* buf, size_t size, off_t offset,
     
     int result = g_adf_image->write_file(block_num, buf, size, static_cast<size_t>(offset));
     
-    std::cerr << "DEBUG: write returned " << result << " bytes (requested " << size << ")" << std::endl;
+    DBG(std::cerr << "DEBUG: write returned " << result << " bytes (requested " << size << ")" << std::endl);
     
     // Clear directory cache so getattr reports updated file size
     if (result > 0) {
@@ -1661,19 +1672,19 @@ static int write(const char* path, const char* buf, size_t size, off_t offset,
 static int create(const char* path, mode_t mode, struct fuse_file_info* fi) {
     if (!g_adf_image) return -EIO;
     
-    std::cerr << "DEBUG: create called for: " << path << std::endl;
+    DBG(std::cerr << "DEBUG: create called for: " << path << std::endl);
     
     int result = g_adf_image->create_file(path, mode);
     
-    std::cerr << "DEBUG: create_file returned: " << result << std::endl;
+    DBG(std::cerr << "DEBUG: create_file returned: " << result << std::endl);
     
     if (result == 0) {
         auto entry = g_adf_image->get_entry(path);
         if (entry) {
             fi->fh = entry->block_num;
-            std::cerr << "DEBUG: File created successfully, block=" << entry->block_num << std::endl;
+            DBG(std::cerr << "DEBUG: File created successfully, block=" << entry->block_num << std::endl);
         } else {
-            std::cerr << "DEBUG: WARNING: File created but can't get entry!" << std::endl;
+            DBG(std::cerr << "DEBUG: WARNING: File created but can't get entry!" << std::endl);
         }
         g_adf_image->sync_to_disk();
     }

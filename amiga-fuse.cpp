@@ -22,6 +22,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -31,8 +32,14 @@
 #include <unordered_map>
 #include <vector>
 #include <set>
+#include <limits>
 
 namespace amiga_fuse {
+
+// Helper for 32-bit overflow detection
+static inline bool add_would_overflow_u32(size_t a, size_t b) {
+    return a > std::numeric_limits<uint32_t>::max() - b;
+}
 
 // Constants
 constexpr size_t BLOCK_SIZE = 512;
@@ -60,6 +67,8 @@ constexpr uint32_t DOS_FFS_DC = 0x444F5305;
 namespace endian {
     template<typename T>
     constexpr T byteswap(T value) noexcept {
+        static_assert(std::is_integral_v<T>, "byteswap requires integral type");
+        
         if constexpr (sizeof(T) == 1) {
             return value;
         } else if constexpr (sizeof(T) == 2) {
@@ -68,6 +77,8 @@ namespace endian {
             return static_cast<T>(__builtin_bswap32(static_cast<std::uint32_t>(value)));
         } else if constexpr (sizeof(T) == 8) {
             return static_cast<T>(__builtin_bswap64(static_cast<std::uint64_t>(value)));
+        } else {
+            static_assert(sizeof(T) <= 8, "Unsupported type size for byte swapping");
         }
     }
 
@@ -191,9 +202,9 @@ struct BitmapExtBlock {
 };
 #pragma pack(pop)
 
-// Verify block structures are exactly 512 bytes (except RootBlock which uses spec layout)
+// Verify block structures are exactly 512 bytes
 static_assert(sizeof(BootBlock) == BLOCK_SIZE, "BootBlock must be 512 bytes");
-// RootBlock uses exact Amiga spec layout - size may vary, parsed by offsets
+static_assert(sizeof(RootBlock) == BLOCK_SIZE, "RootBlock must be 512 bytes");
 static_assert(sizeof(FileBlock) == BLOCK_SIZE, "FileBlock must be 512 bytes");
 static_assert(sizeof(DataBlock) == BLOCK_SIZE, "DataBlock must be 512 bytes");
 static_assert(sizeof(BitmapBlock) == BLOCK_SIZE, "BitmapBlock must be 512 bytes");
@@ -225,6 +236,9 @@ private:
     std::unordered_map<std::string, std::vector<Entry>> dir_cache_;
     std::set<uint32_t> free_blocks_;
     std::set<uint32_t> used_blocks_;
+    
+    // Thread safety for FUSE multithreading
+    mutable std::mutex fs_mutex_;
     
 public:
     explicit AdfImage(std::string_view filename) : filename_(filename) {}
@@ -338,8 +352,10 @@ public:
         
         dos_type_ = endian::from_big_endian(boot->disk_type);
         
-        // Standard DD disk root block is always at 880 (per Amiga spec, not in boot)
-        root_block_num_ = 880;
+        // Compute root block from image size (works for DD, HD, and other formats)
+        uint32_t total_blocks = static_cast<uint32_t>(file_size_ / BLOCK_SIZE);
+        root_block_num_ = total_blocks / 2;          // e.g., 1760/2 = 880
+        if (root_block_num_ <= 1) return false;      // sanity check
         
         is_ffs_ = (dos_type_ == DOS_FFS || dos_type_ == DOS_FFS_INTL || dos_type_ == DOS_FFS_DC);
         
@@ -350,6 +366,15 @@ public:
         
         const auto* root = get_block<RootBlock>(root_block_num_);
         if (!root) return false;
+        
+        // Verify root block checksum
+        uint32_t stored_checksum = endian::from_big_endian(root->checksum);
+        uint32_t calculated_checksum = calculate_checksum(root, 5);  // RootBlock checksum at offset 5
+        if (stored_checksum != calculated_checksum) {
+            std::cerr << "Warning: Root block checksum mismatch at block " << root_block_num_ 
+                      << " (expected: " << std::hex << calculated_checksum 
+                      << ", found: " << stored_checksum << ")" << std::dec << std::endl;
+        }
         
         uint32_t root_type = endian::from_big_endian(root->type);
         int32_t root_sec_type = endian::from_big_endian(root->sec_type);
@@ -412,7 +437,7 @@ public:
                     uint32_t block_num = base_block + j * 32 + bit;
                     if (block_num >= total_blocks) break;
                     
-                    if (!(map_word & (1 << bit))) {
+                    if (!(map_word & (1u << bit))) {
                         // Bit clear = block used
                         used_blocks_.insert(block_num);
                         free_blocks_.erase(block_num);
@@ -489,6 +514,7 @@ public:
         }
     }
     
+    // requires fs_mutex_ held
     uint32_t allocate_block() {
         if (free_blocks_.empty()) return 0;
         
@@ -503,7 +529,7 @@ public:
         
         uint32_t bm_block = endian::from_big_endian(root->bm_pages[bitmap_index]);
         if (bm_block == 0) {
-            // Cannot update bitmap - allocation would fail
+            // Disk full - no bitmap space for allocation (bitmap extension not implemented)
             return 0;
         }
         
@@ -523,6 +549,7 @@ public:
         return block;
     }
     
+    // requires fs_mutex_ held
     void free_block(uint32_t block) {
         if (block < 2 || block == root_block_num_) return; // Don't free system blocks
         
@@ -559,9 +586,9 @@ public:
         
         uint32_t map_word = endian::from_big_endian(bitmap->map[word_index]);
         if (is_free) {
-            map_word |= (1 << bit_index);  // Set bit = free
+            map_word |= (1u << bit_index);  // Set bit = free
         } else {
-            map_word &= ~(1 << bit_index); // Clear bit = used
+            map_word &= ~(1u << bit_index); // Clear bit = used
         }
         bitmap->map[word_index] = endian::to_big_endian(map_word);
         
@@ -569,15 +596,37 @@ public:
         update_bitmap_checksum(bitmap);
     }
     
-    uint32_t hash_name(const std::string& name) {
-        uint32_t hash = static_cast<uint32_t>(name.length());
-        for (unsigned char c : name) {
-            hash = hash * 13 + static_cast<uint32_t>(std::toupper(c));
-        }
-        return hash % HASH_TABLE_SIZE;
+    // ASCII-only uppercase for locale-independent Amiga hash
+    inline unsigned char ascii_upper(unsigned char c) {
+        return (c >= 'a' && c <= 'z') ? c - 'a' + 'A' : c;
     }
     
-    std::optional<std::vector<Entry>> list_directory(const std::string& path) {
+    // Case-insensitive ASCII comparison for Amiga filename semantics
+    static bool equals_icase_ascii(std::string_view a, std::string_view b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) {
+            auto A = (a[i] >= 'a' && a[i] <= 'z') ? a[i] - 'a' + 'A' : a[i];
+            auto B = (b[i] >= 'a' && b[i] <= 'z') ? b[i] - 'a' + 'A' : b[i];
+            if (A != B) return false;
+        }
+        return true;
+    }
+    
+    uint32_t hash_name(const std::string& name) {
+        // Canonical Amiga hash function: h = 0; for (c) h = h*13 + toupper(c);
+        uint32_t h = 0;
+        for (unsigned char c : name) {
+            h = h * 13 + ascii_upper(c);
+        }
+        return h % HASH_TABLE_SIZE;
+    }
+    
+    [[nodiscard]] std::optional<std::vector<Entry>> list_directory(const std::string& path) {
+        std::lock_guard<std::mutex> lock(fs_mutex_);
+        return list_directory_unsafe(path);
+    }
+    
+    [[nodiscard]] std::optional<std::vector<Entry>> list_directory_unsafe(const std::string& path) {
         if (auto cached = get_cached_dir(path)) {
             return cached;
         }
@@ -586,6 +635,7 @@ public:
         if (dir_block == 0) return std::nullopt;
         
         std::vector<Entry> entries;
+        std::set<uint32_t> seen_blocks; // Prevent duplicate entries
         const auto* dir = get_block<FileBlock>(dir_block);
         if (!dir) return std::nullopt;
         
@@ -598,6 +648,13 @@ public:
             );
             
             while (block_num != 0) {
+                // Skip if we've already seen this block
+                if (seen_blocks.count(block_num)) {
+                    std::cerr << "DEBUG: Skipping duplicate block " << block_num << std::endl;
+                    break; // Don't continue chain - likely circular reference
+                }
+                seen_blocks.insert(block_num);
+                
                 const auto* block = get_block<FileBlock>(block_num);
                 if (!block) break;
                 
@@ -628,13 +685,29 @@ public:
         return entries;
     }
     
-    std::optional<Entry> get_entry(const std::string& path) {
+    [[nodiscard]] std::optional<Entry> get_entry(const std::string& path) {
+        std::lock_guard<std::mutex> lock(fs_mutex_);
+        return get_entry_unsafe(path);
+    }
+    
+    [[nodiscard]] std::optional<Entry> get_entry_unsafe(const std::string& path) {
         if (path == "/" || path.empty()) {
             Entry root;
             root.name = "";
             root.is_directory = true;
             root.size = 0;
-            root.mtime = time(nullptr);
+            
+            // Report real root directory mtime from disk instead of time(nullptr)
+            auto* root_block = get_block<RootBlock>(root_block_num_);
+            if (root_block) {
+                uint32_t days = endian::from_big_endian(root_block->days);
+                uint32_t mins = endian::from_big_endian(root_block->mins);
+                uint32_t ticks = endian::from_big_endian(root_block->ticks);
+                root.mtime = amiga_to_unix_time(days, mins, ticks);
+            } else {
+                root.mtime = time(nullptr);
+            }
+            
             root.block_num = root_block_num_;
             return root;
         }
@@ -643,7 +716,7 @@ public:
         std::string parent_path = (last_slash == 0) ? "/" : path.substr(0, last_slash);
         std::string entry_name = path.substr(last_slash + 1);
         
-        auto entries = list_directory(parent_path);
+        auto entries = list_directory_unsafe(parent_path);
         if (!entries) return std::nullopt;
         
         for (const auto& entry : *entries) {
@@ -656,6 +729,7 @@ public:
     }
     
     std::vector<uint8_t> read_file(uint32_t file_block_num, size_t offset, size_t size) {
+        std::lock_guard<std::mutex> lock(fs_mutex_);
         if (!file_block_num) return {};
 
         const auto* file_block = get_block<FileBlock>(file_block_num);
@@ -679,6 +753,13 @@ public:
         while (cur && cur_idx < want_idx) {
             const auto* db = get_block<DataBlock>(cur);
             if (!db) { cur = 0; break; }
+            
+            // Defensive check against corruption
+            if (endian::from_big_endian(db->type) != static_cast<uint32_t>(T_DATA) ||
+                endian::from_big_endian(db->header_key) != file_block_num) {
+                cur = 0; break; // Stop on corruption
+            }
+            
             cur = endian::from_big_endian(db->next_data);
             ++cur_idx;
         }
@@ -697,6 +778,12 @@ public:
 
             const auto* db = get_block<DataBlock>(cur);
             if (!db) break;
+            
+            // Defensive check against corruption
+            if (endian::from_big_endian(db->type) != static_cast<uint32_t>(T_DATA) ||
+                endian::from_big_endian(db->header_key) != file_block_num) {
+                break; // Stop on corruption
+            }
 
             uint32_t db_size = std::min<uint32_t>(488u, endian::from_big_endian(db->data_size));
             size_t need = std::min<size_t>(size - produced, 488 - pos_in_block);
@@ -725,8 +812,12 @@ public:
     }
     
     int write_file(uint32_t file_block_num, const void* buf, size_t size, size_t offset) {
+        std::lock_guard<std::mutex> lock(fs_mutex_);
         if (read_only_) return -EROFS;
         if (file_block_num == 0) return -ENOENT;
+        
+        // Guard against 32-bit overflow
+        if (add_would_overflow_u32(offset, size)) return -EFBIG;
         
         auto* file_block = get_block_writable<FileBlock>(file_block_num);
         if (!file_block) return -EIO;
@@ -772,6 +863,12 @@ public:
         while (current_block != 0) {
             const auto* data_block = get_block<DataBlock>(current_block);
             if (!data_block) return -EIO;
+            
+            // Defensive check against corruption
+            if (endian::from_big_endian(data_block->type) != static_cast<uint32_t>(T_DATA) ||
+                endian::from_big_endian(data_block->header_key) != file_block_num) {
+                return -EIO; // Stop on corruption
+            }
             
             // If target offset is within this block range, break
             if (current_pos + 488 > target_offset) break;
@@ -862,9 +959,10 @@ public:
             // Write data
             std::memcpy(data_block->data + block_offset, data + bytes_written, write_size);
             
-            // Update block data size
+            // Update block data size with clamping
             uint32_t old_size = endian::from_big_endian(data_block->data_size);
             uint32_t new_size = std::max(old_size, static_cast<uint32_t>(block_offset + write_size));
+            if (new_size > 488u) new_size = 488u; // Clamp to block data limit
             data_block->data_size = endian::to_big_endian(new_size);
             
             update_checksum(data_block);
@@ -880,6 +978,10 @@ public:
             }
         }
         
+        // Update high_seq to reflect last data block sequence index
+        uint32_t blocks = (endian::from_big_endian(file_block->file_size) + 487) / 488;
+        file_block->high_seq = endian::to_big_endian(blocks ? (blocks - 1) : 0u);
+        
         // Update file timestamps after successful write
         touch_fileblock(file_block);
         update_checksum(file_block);
@@ -888,6 +990,7 @@ public:
     }
     
     int create_file(const std::string& path, mode_t mode) {
+        std::lock_guard<std::mutex> lock(fs_mutex_);
         if (read_only_) return -EROFS;
         
         size_t last_slash = path.find_last_of('/');
@@ -896,8 +999,12 @@ public:
         
         if (filename.length() > BCPL_STRING_MAX) return -ENAMETOOLONG;
         
-        // Check if file already exists
-        if (get_entry(path).has_value()) return -EEXIST;
+        // Check if file already exists (case-insensitive for Amiga semantics)
+        if (auto ents = list_directory_unsafe(parent_path)) {
+            for (const auto& e : *ents) {
+                if (equals_icase_ascii(e.name, filename)) return -EEXIST;
+            }
+        }
         
         // Find parent directory block
         uint32_t parent_block = find_directory_block(parent_path);
@@ -943,18 +1050,44 @@ public:
     }
     
     int delete_file(const std::string& path) {
-        if (read_only_) return -EROFS;
+        std::lock_guard<std::mutex> lock(fs_mutex_);
+        if (read_only_) {
+            std::cerr << "DEBUG: delete_file failed - filesystem is read-only" << std::endl;
+            return -EROFS;
+        }
         
-        auto entry = get_entry(path);
-        if (!entry) return -ENOENT;
-        if (entry->is_directory) return -EISDIR;
+        auto entry = get_entry_unsafe(path);
+        if (!entry) {
+            std::cerr << "DEBUG: delete_file failed - file not found: " << path << std::endl;
+            return -ENOENT;
+        }
+        if (entry->is_directory) {
+            std::cerr << "DEBUG: delete_file failed - path is directory: " << path << std::endl;
+            return -EISDIR;
+        }
+        
+        std::cerr << "DEBUG: delete_file proceeding with file: " << path 
+                  << " (block=" << entry->block_num << ")" << std::endl;
         
         size_t last_slash = path.find_last_of('/');
         std::string parent_path = (last_slash == 0) ? "/" : path.substr(0, last_slash);
         uint32_t parent_block = find_directory_block(parent_path);
         
         // Remove from parent directory
+        
         remove_from_directory(parent_block, entry->block_num, entry->name);
+        
+        // Validate root block integrity after directory modification
+        if (parent_block == root_block_num_) {
+            const auto* root = get_block<RootBlock>(root_block_num_);
+            if (root) {
+                uint32_t calculated = calculate_checksum(root, 5);
+                uint32_t stored = endian::from_big_endian(root->checksum);
+                if (calculated != stored) {
+                    std::cerr << "WARNING: Root block checksum mismatch after delete!" << std::endl;
+                }
+            }
+        }
         
         // Free data blocks
         auto* file = get_block<FileBlock>(entry->block_num);
@@ -962,7 +1095,15 @@ public:
             uint32_t data_block = endian::from_big_endian(file->first_data);
             while (data_block != 0) {
                 auto* data = get_block<DataBlock>(data_block);
-                uint32_t next = data ? endian::from_big_endian(data->next_data) : 0;
+                if (!data) break;
+                
+                // Defensive check against corruption
+                if (endian::from_big_endian(data->type) != static_cast<uint32_t>(T_DATA) ||
+                    endian::from_big_endian(data->header_key) != entry->block_num) {
+                    break; // Stop on corruption
+                }
+                
+                uint32_t next = endian::from_big_endian(data->next_data);
                 free_block(data_block);
                 data_block = next;
             }
@@ -971,16 +1112,18 @@ public:
         // Free file block
         free_block(entry->block_num);
         
-        // Clear cache
+        // Clear cache and sync to disk
         dir_cache_.clear();
+        sync_to_disk();
         
         return 0;
     }
     
     int truncate_file(const std::string& path, off_t size) {
+        std::lock_guard<std::mutex> lock(fs_mutex_);
         if (read_only_) return -EROFS;
         
-        auto entry = get_entry(path);
+        auto entry = get_entry_unsafe(path);
         if (!entry) return -ENOENT;
         if (entry->is_directory) return -EISDIR;
         
@@ -1005,14 +1148,30 @@ public:
                 while (data_block != 0 && block_count < blocks_needed) {
                     prev_block = data_block;
                     auto* data = get_block<DataBlock>(data_block);
-                    data_block = data ? endian::from_big_endian(data->next_data) : 0;
+                    if (!data) break;
+                    
+                    // Defensive check against corruption
+                    if (endian::from_big_endian(data->type) != static_cast<uint32_t>(T_DATA) ||
+                        endian::from_big_endian(data->header_key) != entry->block_num) {
+                        break; // Stop on corruption
+                    }
+                    
+                    data_block = endian::from_big_endian(data->next_data);
                     block_count++;
                 }
                 
                 // Free remaining blocks
                 while (data_block != 0) {
                     auto* data = get_block<DataBlock>(data_block);
-                    uint32_t next = data ? endian::from_big_endian(data->next_data) : 0;
+                    if (!data) break;
+                    
+                    // Defensive check against corruption
+                    if (endian::from_big_endian(data->type) != static_cast<uint32_t>(T_DATA) ||
+                        endian::from_big_endian(data->header_key) != entry->block_num) {
+                        break; // Stop on corruption
+                    }
+                    
+                    uint32_t next = endian::from_big_endian(data->next_data);
                     free_block(data_block);
                     data_block = next;
                 }
@@ -1022,9 +1181,10 @@ public:
                     auto* data = get_block_writable<DataBlock>(prev_block);
                     if (data) {
                         data->next_data = endian::to_big_endian(0u);
-                        // Set correct data_size for the truncated block
+                        // Set correct data_size for the truncated block with clamping
                         uint32_t remainder = static_cast<uint32_t>(size % 488);
                         if (remainder == 0 && size > 0) remainder = 488;
+                        if (remainder > 488u) remainder = 488u; // Defensive clamp
                         data->data_size = endian::to_big_endian(remainder);
                         update_checksum(data);
                     }
@@ -1038,6 +1198,10 @@ public:
         // Update file size
         file->file_size = endian::to_big_endian(static_cast<uint32_t>(size));
         
+        // Update high_seq to reflect last data block sequence index
+        uint32_t blocks = (static_cast<uint32_t>(size) + 487) / 488;
+        file->high_seq = endian::to_big_endian(blocks ? (blocks - 1) : 0u);
+        
         // Update timestamp after truncation
         touch_fileblock(file);
         update_checksum(file);
@@ -1046,6 +1210,7 @@ public:
     }
     
     int create_directory(const std::string& path, mode_t mode) {
+        std::lock_guard<std::mutex> lock(fs_mutex_);
         if (read_only_) return -EROFS;
         
         size_t last_slash = path.find_last_of('/');
@@ -1054,8 +1219,12 @@ public:
         
         if (dirname.length() > BCPL_STRING_MAX) return -ENAMETOOLONG;
         
-        // Check if already exists
-        if (get_entry(path).has_value()) return -EEXIST;
+        // Check if directory already exists (case-insensitive for Amiga semantics)
+        if (auto ents = list_directory_unsafe(parent_path)) {
+            for (const auto& e : *ents) {
+                if (equals_icase_ascii(e.name, dirname)) return -EEXIST;
+            }
+        }
         
         // Find parent directory
         uint32_t parent_block = find_directory_block(parent_path);
@@ -1099,15 +1268,16 @@ public:
     }
     
     int delete_directory(const std::string& path) {
+        std::lock_guard<std::mutex> lock(fs_mutex_);
         if (read_only_) return -EROFS;
         if (path == "/" || path.empty()) return -EINVAL;
         
-        auto entry = get_entry(path);
+        auto entry = get_entry_unsafe(path);
         if (!entry) return -ENOENT;
         if (!entry->is_directory) return -ENOTDIR;
         
         // Check if directory is empty
-        auto contents = list_directory(path);
+        auto contents = list_directory_unsafe(path);
         if (contents && !contents->empty()) return -ENOTEMPTY;
         
         size_t last_slash = path.find_last_of('/');
@@ -1120,8 +1290,9 @@ public:
         // Free directory block
         free_block(entry->block_num);
         
-        // Clear cache
+        // Clear cache and sync to disk
         dir_cache_.clear();
+        sync_to_disk();
         
         return 0;
     }
@@ -1130,16 +1301,21 @@ public:
     bool is_ffs() const { return is_ffs_; }
     
     void clear_cache() {
+        std::lock_guard<std::mutex> lock(fs_mutex_);
         dir_cache_.clear();
     }
     
     void sync_to_disk() {
         if (mapped_data_ && !read_only_) {
             msync(mapped_data_, file_size_, MS_SYNC);
+            // Also ensure kernel writes complete
+            fsync(fd_);
         }
     }
     
     size_t get_actual_file_size(uint32_t file_block_num) {
+        std::lock_guard<std::mutex> lock(fs_mutex_);
+        
         const auto* file_block = get_block<FileBlock>(file_block_num);
         if (!file_block) return 0;
         
@@ -1147,7 +1323,8 @@ public:
     }
     
 private:
-    std::optional<std::vector<Entry>> get_cached_dir(const std::string& path) {
+    // requires fs_mutex_ held
+    [[nodiscard]] std::optional<std::vector<Entry>> get_cached_dir(const std::string& path) {
         auto it = dir_cache_.find(path);
         if (it != dir_cache_.end()) {
             return it->second;
@@ -1155,6 +1332,7 @@ private:
         return std::nullopt;
     }
     
+    // requires fs_mutex_ held
     void cache_directory(const std::string& path, const std::vector<Entry>& entries) {
         dir_cache_[path] = entries;
     }
@@ -1164,7 +1342,7 @@ private:
             return root_block_num_;
         }
         
-        auto entry = get_entry(path);
+        auto entry = get_entry_unsafe(path);
         if (entry && entry->is_directory) {
             return entry->block_num;
         }
@@ -1175,17 +1353,24 @@ private:
     void add_to_directory(uint32_t dir_block, uint32_t file_block, const std::string& name) {
         uint32_t hash = hash_name(name);
         
+        std::cerr << "DEBUG: add_to_directory: name='" << name << "' hash=" << hash 
+                  << " file_block=" << file_block << " dir_block=" << dir_block << std::endl;
+        
         if (dir_block == root_block_num_) {
             auto* root = get_block_writable<RootBlock>(dir_block);
             if (!root) return;
             
             uint32_t existing = endian::from_big_endian(root->hash_table[hash]);
+            std::cerr << "DEBUG: root hash_table[" << hash << "] was " << existing 
+                      << ", setting to " << file_block << std::endl;
+                      
             root->hash_table[hash] = endian::to_big_endian(file_block);
             
             // Link to existing chain
             auto* file = get_block_writable<FileBlock>(file_block);
             if (file) {
                 file->hash_chain = endian::to_big_endian(existing);
+                std::cerr << "DEBUG: Set file->hash_chain to " << existing << std::endl;
                 update_checksum(file);
             }
             
@@ -1211,42 +1396,58 @@ private:
     }
     
     void remove_from_directory(uint32_t dir_block, uint32_t file_block, const std::string& name) {
-        uint32_t hash = hash_name(name);
         
         if (dir_block == root_block_num_) {
             auto* root = get_block_writable<RootBlock>(dir_block);
             if (!root) return;
             
-            uint32_t current = endian::from_big_endian(root->hash_table[hash]);
-            if (current == file_block) {
-                // First in chain
-                auto* file = get_block<FileBlock>(file_block);
-                root->hash_table[hash] = file ? endian::to_big_endian(endian::from_big_endian(file->hash_chain)) : 0;
-                touch_rootblock(root);
-                update_checksum(root);
-            } else {
-                // Search chain
-                if (remove_from_chain(current, file_block)) {
+            // Search ALL hash buckets to find the file (Amiga filesystems can have corruption)
+            for (int hash = 0; hash < HASH_TABLE_SIZE; hash++) {
+                uint32_t current = endian::from_big_endian(root->hash_table[hash]);
+                if (current == 0) continue;
+                
+                // Check if first in chain matches
+                if (current == file_block) {
+                    
+                    auto* file = get_block<FileBlock>(file_block);
+                    uint32_t next_in_chain = file ? endian::from_big_endian(file->hash_chain) : 0;
+                    root->hash_table[hash] = endian::to_big_endian(next_in_chain);
                     touch_rootblock(root);
                     update_checksum(root);
+                    return; // Found and removed
+                }
+                
+                // Search the chain
+                if (remove_from_chain(current, file_block)) {
+                    
+                    touch_rootblock(root);
+                    update_checksum(root);
+                    return; // Found and removed
                 }
             }
+            
+            // Not found in any bucket - this shouldn't happen after comprehensive search
         } else {
             auto* dir = get_block_writable<FileBlock>(dir_block);
             if (!dir) return;
             
-            uint32_t current = endian::from_big_endian(dir->data_blocks[hash]);
-            if (current == file_block) {
-                // First in chain
-                auto* file = get_block<FileBlock>(file_block);
-                dir->data_blocks[hash] = file ? endian::to_big_endian(endian::from_big_endian(file->hash_chain)) : 0;
-                touch_fileblock(dir);
-                update_checksum(dir);
-            } else {
-                // Search chain
+            // Search ALL hash buckets for subdirectories too
+            for (int hash = 0; hash < HASH_TABLE_SIZE; hash++) {
+                uint32_t current = endian::from_big_endian(dir->data_blocks[hash]);
+                if (current == 0) continue;
+                
+                if (current == file_block) {
+                    auto* file = get_block<FileBlock>(file_block);
+                    dir->data_blocks[hash] = file ? endian::to_big_endian(endian::from_big_endian(file->hash_chain)) : 0;
+                    touch_fileblock(dir);
+                    update_checksum(dir);
+                    return; // Found and removed
+                }
+                
                 if (remove_from_chain(current, file_block)) {
                     touch_fileblock(dir);
                     update_checksum(dir);
+                    return; // Found and removed
                 }
             }
         }
@@ -1334,12 +1535,21 @@ static int getattr(const char* path, struct stat* stbuf) {
     auto entry = g_adf_image->get_entry(path);
     if (!entry) return -ENOENT;
     
-    stbuf->st_ino = std::hash<std::string>{}(path);
-    if (stbuf->st_ino <= 1) stbuf->st_ino = 2;
+    // Use stable inode based on block number
+    stbuf->st_ino = entry->block_num ? entry->block_num : 2;
     
     if (entry->is_directory) {
         stbuf->st_mode = S_IFDIR | (g_adf_image->is_read_only() ? 0555 : 0755);
-        stbuf->st_nlink = 2;
+        
+        // Calculate st_nlink = 2 + subdirectory count for picky tools
+        auto entries = g_adf_image->list_directory(path);
+        nlink_t subdir_count = 0;
+        if (entries) {
+            for (const auto& e : *entries) {
+                if (e.is_directory) subdir_count++;
+            }
+        }
+        stbuf->st_nlink = 2 + subdir_count;
         stbuf->st_size = 0;
     } else {
         stbuf->st_mode = S_IFREG | (g_adf_image->is_read_only() ? 0444 : 0644);
@@ -1390,6 +1600,13 @@ static int open(const char* path, struct fuse_file_info* fi) {
     if (g_adf_image->is_read_only() && (fi->flags & O_ACCMODE) != O_RDONLY)
         return -EROFS;
 
+    // Handle O_TRUNC flag - some tools open with truncate instead of calling truncate(2) explicitly
+    if (!g_adf_image->is_read_only() && (fi->flags & O_TRUNC)) {
+        int r = g_adf_image->truncate_file(path, 0);
+        if (r) return r;
+        g_adf_image->clear_cache();
+    }
+
     fi->fh = entry->block_num;
     return 0;
 }
@@ -1397,6 +1614,10 @@ static int open(const char* path, struct fuse_file_info* fi) {
 static int read(const char* path, char* buf, size_t size, off_t offset,
                 struct fuse_file_info* fi) {
     if (!g_adf_image) return -EIO;
+    
+    // Guard against negative offsets at FUSE boundary
+    if (offset < 0) return -EINVAL;
+    if (size == 0) return 0;
     
     uint32_t block_num = static_cast<uint32_t>(fi->fh);
     if (block_num == 0) {
@@ -1416,6 +1637,13 @@ static int write(const char* path, const char* buf, size_t size, off_t offset,
                  struct fuse_file_info* fi) {
     if (!g_adf_image) return -EIO;
     
+    // Guard against negative offsets at FUSE boundary
+    if (offset < 0) return -EINVAL;
+    if (size == 0) return 0;
+    
+    // Guard against 32-bit overflow
+    if (add_would_overflow_u32(static_cast<size_t>(offset), size)) return -EFBIG;
+    
     uint32_t block_num = static_cast<uint32_t>(fi->fh);
     if (block_num == 0) {
         auto entry = g_adf_image->get_entry(path);
@@ -1424,6 +1652,8 @@ static int write(const char* path, const char* buf, size_t size, off_t offset,
     }
     
     int result = g_adf_image->write_file(block_num, buf, size, static_cast<size_t>(offset));
+    
+    std::cerr << "DEBUG: write returned " << result << " bytes (requested " << size << ")" << std::endl;
     
     // Clear directory cache so getattr reports updated file size
     if (result > 0) {
@@ -1436,12 +1666,21 @@ static int write(const char* path, const char* buf, size_t size, off_t offset,
 static int create(const char* path, mode_t mode, struct fuse_file_info* fi) {
     if (!g_adf_image) return -EIO;
     
+    std::cerr << "DEBUG: create called for: " << path << std::endl;
+    
     int result = g_adf_image->create_file(path, mode);
+    
+    std::cerr << "DEBUG: create_file returned: " << result << std::endl;
+    
     if (result == 0) {
         auto entry = g_adf_image->get_entry(path);
         if (entry) {
             fi->fh = entry->block_num;
+            std::cerr << "DEBUG: File created successfully, block=" << entry->block_num << std::endl;
+        } else {
+            std::cerr << "DEBUG: WARNING: File created but can't get entry!" << std::endl;
         }
+        g_adf_image->sync_to_disk();
     }
     
     return result;
@@ -1449,11 +1688,25 @@ static int create(const char* path, mode_t mode, struct fuse_file_info* fi) {
 
 static int unlink(const char* path) {
     if (!g_adf_image) return -EIO;
-    return g_adf_image->delete_file(path);
+    
+    int result = g_adf_image->delete_file(path);
+    
+    if (result == 0) {
+        g_adf_image->clear_cache();
+        g_adf_image->sync_to_disk();
+    }
+    return result;
 }
 
 static int truncate(const char* path, off_t size) {
     if (!g_adf_image) return -EIO;
+    
+    // Guard against negative sizes at FUSE boundary
+    if (size < 0) return -EINVAL;
+    
+    // Guard against 32-bit overflow
+    if (size > std::numeric_limits<uint32_t>::max()) return -EFBIG;
+    
     int result = g_adf_image->truncate_file(path, size);
     if (result == 0) {
         g_adf_image->clear_cache();
@@ -1468,7 +1721,12 @@ static int mkdir(const char* path, mode_t mode) {
 
 static int rmdir(const char* path) {
     if (!g_adf_image) return -EIO;
-    return g_adf_image->delete_directory(path);
+    int result = g_adf_image->delete_directory(path);
+    if (result == 0) {
+        g_adf_image->clear_cache();
+        g_adf_image->sync_to_disk();
+    }
+    return result;
 }
 
 static int fsync(const char*, int, struct fuse_file_info*) {
@@ -1478,6 +1736,37 @@ static int fsync(const char*, int, struct fuse_file_info*) {
 
 static int flush(const char*, struct fuse_file_info*) {
     if (g_adf_image) g_adf_image->sync_to_disk();
+    return 0;
+}
+
+// Add mknod shim for maximum tool compatibility
+// Some callers do mknod + open instead of create
+static int mknod(const char* path, mode_t mode, dev_t rdev) {
+    if (!g_adf_image) return -EIO;
+    
+    // Only support regular files (S_IFREG)
+    if (!S_ISREG(mode)) return -EPERM;
+    
+    // Use create_file to handle the actual file creation
+    return g_adf_image->create_file(path, mode);
+}
+
+// Add missing permission operations
+static int chmod(const char* path, mode_t mode) {
+    // Amiga filesystems don't support Unix permissions
+    // Just return success to satisfy tools like cp
+    return 0;
+}
+
+static int chown(const char* path, uid_t uid, gid_t gid) {
+    // Amiga filesystems don't support Unix ownership
+    // Just return success to satisfy tools
+    return 0;
+}
+
+static int utimens(const char* path, const struct timespec tv[2]) {
+    // For now, ignore timestamp updates from external tools
+    // TODO: Could update Amiga timestamps here
     return 0;
 }
 
@@ -1499,6 +1788,10 @@ void initialize_fuse_operations() {
     amiga_fuse_operations.rmdir = fuse_ops::rmdir;
     amiga_fuse_operations.flush = fuse_ops::flush;
     amiga_fuse_operations.fsync = fuse_ops::fsync;
+    amiga_fuse_operations.mknod = fuse_ops::mknod;
+    amiga_fuse_operations.chmod = fuse_ops::chmod;
+    amiga_fuse_operations.chown = fuse_ops::chown;
+    amiga_fuse_operations.utimens = fuse_ops::utimens;
 }
 
 } // namespace amiga_fuse
@@ -1531,9 +1824,10 @@ int main(int argc, char* argv[]) {
     // Initialize FUSE operations structure
     initialize_fuse_operations();
     
-    // Adjust arguments for FUSE
-    argv[1] = argv[2];
-    argc--;
+    // Adjust arguments for FUSE - safely shift arguments
+    std::memmove(argv + 1, argv + 2, (argc - 1) * sizeof(char*));
+    --argc;
+    argv[argc] = nullptr; // now argv = [prog, mount_point, ...fuse_options]
     
     return fuse_main(argc, argv, &amiga_fuse_operations, nullptr);
 }

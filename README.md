@@ -42,6 +42,11 @@ sudo pacman -S fuse3 cmake pkgconf base-devel
 
 ## Building this thing
 
+### Requirements
+- C++20 or higher (current setup uses C++23)
+- macFUSE on macOS or libfuse3-dev/libfuse-dev on Linux
+
+### Quick Build
 Just run the build script:
 ```bash
 ./build.sh
@@ -55,12 +60,29 @@ That's it! It'll figure out your platform and build everything. If you want to s
 ./build.sh --clean         # Start over
 ```
 
+### Manual Build Options
+
 If you're the type who likes doing things manually:
 ```bash
 mkdir build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 cmake --build .
 ```
+
+Or if you prefer direct compilation (macOS):
+```bash
+# Intel Macs / older setups
+clang++ -std=c++20 -D_FILE_OFFSET_BITS=64 \
+  -I/usr/local/include/osxfuse -L/usr/local/lib \
+  amiga-fuse.cpp -lfuse -o amiga-fuse
+
+# Apple Silicon / Homebrew
+clang++ -std=c++20 -D_FILE_OFFSET_BITS=64 \
+  -I/opt/homebrew/include/osxfuse -L/opt/homebrew/lib \
+  amiga-fuse.cpp -lfuse -o amiga-fuse
+```
+
+The CMake build produces a ~53KB optimized binary with all safety features enabled.
 
 ## Using it
 
@@ -101,9 +123,17 @@ The code handles all the weird Amiga filesystem details automatically - block al
 
 ## The nerdy details
 
-Right now this handles standard 880K floppy ADFs with both OFS and FFS filesystems. It's written in C++23 (because why not use modern stuff), and it's optimized to be small and fast. The binary comes out to about 52KB which is pretty decent.
+Right now this handles standard 880K floppy ADFs with both OFS and FFS filesystems. It's written in C++23 (because why not use modern stuff), and it's optimized to be small and fast. The binary comes out to about 53KB which is pretty decent.
 
 Internally it uses memory-mapped I/O and caches directory info to keep things snappy. All the endian conversion and Amiga-specific quirks are handled transparently.
+
+### Safety Features
+- 32-bit overflow protection against malformed files
+- Defensive corruption checking on block chains
+- Thread-safe operations with proper locking
+- Stable inode numbers based on disk block addresses
+- Amiga case-insensitive filename semantics
+- Complete error handling and bounds checking
 
 ## What doesn't work yet
 

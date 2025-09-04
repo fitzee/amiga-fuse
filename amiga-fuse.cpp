@@ -10,6 +10,8 @@
 #endif
 
 #include <fuse.h>
+#include <cstdint>
+#include <cctype>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -17,7 +19,6 @@
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
-#include <format>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -43,7 +44,6 @@ constexpr size_t MAX_BLOCKS = 1760;  // Standard DD disk
 constexpr int32_t T_HEADER = 2;
 constexpr int32_t T_DATA = 8;
 constexpr int32_t T_LIST = 16;
-constexpr int32_t T_DIRC = 33;
 constexpr int32_t T_SHORT = -3;
 constexpr int32_t T_LONG = -4;
 constexpr int32_t ST_ROOT = 1;
@@ -111,38 +111,39 @@ public:
 // Block structures
 #pragma pack(push, 1)
 struct BootBlock {
-    uint32_t disk_type;
-    uint32_t checksum;
-    uint32_t root_block;
-    uint8_t boot_code[1012];
+    uint32_t disk_type;          // 0-3
+    uint32_t checksum;           // 4-7  
+    uint32_t root_block;         // 8-11
+    uint8_t boot_code[500];      // 12-511 (500 bytes to total 512)
 };
 
+// RootBlock must match exact Amiga spec - do NOT change field sizes
 struct RootBlock {
-    uint32_t type;
-    uint32_t header_key;
-    uint32_t high_seq;
-    uint32_t hash_table_size;
-    uint32_t first_size;
-    uint32_t checksum;
-    uint32_t hash_table[HASH_TABLE_SIZE];
-    uint32_t bm_flag;
-    uint32_t bm_pages[25];
-    uint32_t bm_ext;
-    uint32_t days;
-    uint32_t mins;
-    uint32_t ticks;
-    uint8_t name[32];
-    uint8_t comment[80];
-    uint32_t days2;
-    uint32_t mins2;
-    uint32_t ticks2;
-    uint32_t created_days;
-    uint32_t created_mins;
-    uint32_t created_ticks;
-    uint32_t next_hash;
-    uint32_t parent;
-    uint32_t extension;
-    int32_t sec_type;
+    uint32_t type;                    // 0-3
+    uint32_t header_key;              // 4-7
+    uint32_t high_seq;                // 8-11
+    uint32_t hash_table_size;         // 12-15
+    uint32_t first_size;              // 16-19
+    uint32_t checksum;                // 20-23
+    uint32_t hash_table[HASH_TABLE_SIZE]; // 24-311 (72*4=288 bytes)
+    uint32_t bm_flag;                 // 312-315
+    uint32_t bm_pages[25];            // 316-415 (25*4=100 bytes)
+    uint32_t bm_ext;                  // 416-419
+    uint32_t days;                    // 420-423
+    uint32_t mins;                    // 424-427
+    uint32_t ticks;                   // 428-431
+    uint8_t name[32];                 // 432-463
+    uint8_t reserved1[8];             // 464-471
+    uint32_t days2;                   // 472-475
+    uint32_t mins2;                   // 476-479
+    uint32_t ticks2;                  // 480-483
+    uint32_t created_days;            // 484-487
+    uint32_t created_mins;            // 488-491
+    uint32_t created_ticks;           // 492-495
+    uint32_t next_hash;               // 496-499
+    uint32_t parent;                  // 500-503
+    uint32_t extension;               // 504-507
+    int32_t sec_type;                 // 508-511
 };
 
 struct FileBlock {
@@ -184,11 +185,19 @@ struct BitmapBlock {
 };
 
 struct BitmapExtBlock {
-    uint32_t bitmap_flag;
-    uint32_t next_bitmap;
-    uint32_t bitmap_blocks[127];
+    uint32_t bitmap_flag;        // 0-3
+    uint32_t next_bitmap;        // 4-7
+    uint32_t bitmap_blocks[126]; // 8-511 (126*4=504 bytes, total 512)
 };
 #pragma pack(pop)
+
+// Verify block structures are exactly 512 bytes (except RootBlock which uses spec layout)
+static_assert(sizeof(BootBlock) == BLOCK_SIZE, "BootBlock must be 512 bytes");
+// RootBlock uses exact Amiga spec layout - size may vary, parsed by offsets
+static_assert(sizeof(FileBlock) == BLOCK_SIZE, "FileBlock must be 512 bytes");
+static_assert(sizeof(DataBlock) == BLOCK_SIZE, "DataBlock must be 512 bytes");
+static_assert(sizeof(BitmapBlock) == BLOCK_SIZE, "BitmapBlock must be 512 bytes");
+static_assert(sizeof(BitmapExtBlock) == BLOCK_SIZE, "BitmapExtBlock must be 512 bytes");
 
 // Directory entry
 struct Entry {
@@ -283,7 +292,7 @@ public:
     
     template<typename T>
     const T* get_block(uint32_t block_num) const {
-        if (!is_valid() || block_num * BLOCK_SIZE + sizeof(T) > file_size_) {
+        if (!is_valid() || (block_num + 1ull) * BLOCK_SIZE > file_size_) {
             return nullptr;
         }
         return reinterpret_cast<const T*>(
@@ -293,7 +302,7 @@ public:
     
     template<typename T>
     T* get_block_writable(uint32_t block_num) {
-        if (!is_valid() || read_only_ || block_num * BLOCK_SIZE + sizeof(T) > file_size_) {
+        if (!is_valid() || read_only_ || (block_num + 1ull) * BLOCK_SIZE > file_size_) {
             return nullptr;
         }
         return reinterpret_cast<T*>(
@@ -301,22 +310,26 @@ public:
         );
     }
     
-    uint32_t calculate_checksum(const void* block) {
+    uint32_t calculate_checksum(const void* block, uint32_t checksum_offset = 5) {
         const uint32_t* data = static_cast<const uint32_t*>(block);
         uint32_t sum = 0;
         for (int i = 0; i < 128; i++) {
-            if (i != 5) { // Skip checksum field itself
+            if (i != checksum_offset) { // Skip checksum field itself
                 sum += endian::from_big_endian(data[i]);
             }
         }
         return -sum;
     }
     
-    void update_checksum(void* block) {
+    void update_checksum(void* block, uint32_t checksum_offset = 5) {
         uint32_t* data = static_cast<uint32_t*>(block);
-        data[5] = 0; // Clear checksum field
-        uint32_t checksum = calculate_checksum(block);
-        data[5] = endian::to_big_endian(checksum);
+        data[checksum_offset] = 0; // Clear checksum field
+        uint32_t checksum = calculate_checksum(block, checksum_offset);
+        data[checksum_offset] = endian::to_big_endian(checksum);
+    }
+    
+    void update_bitmap_checksum(BitmapBlock* bitmap) {
+        update_checksum(bitmap, 0); // Bitmap checksum is at offset 0
     }
     
     bool parse_filesystem() {
@@ -324,12 +337,15 @@ public:
         if (!boot) return false;
         
         dos_type_ = endian::from_big_endian(boot->disk_type);
-        root_block_num_ = endian::from_big_endian(boot->root_block);
+        
+        // Standard DD disk root block is always at 880 (per Amiga spec, not in boot)
+        root_block_num_ = 880;
         
         is_ffs_ = (dos_type_ == DOS_FFS || dos_type_ == DOS_FFS_INTL || dos_type_ == DOS_FFS_DC);
         
+        // Validate DOS type but still use standard geometry
         if ((dos_type_ & 0xFFFFFF00) != 0x444F5300) {
-            root_block_num_ = 880;
+            // Not a valid DOS disk, but try standard DD geometry anyway
         }
         
         const auto* root = get_block<RootBlock>(root_block_num_);
@@ -369,10 +385,9 @@ public:
         // Mark system blocks as used
         used_blocks_.insert(0); // Boot block
         used_blocks_.insert(1); // Boot block
-        used_blocks_.insert(root_block_num_);
         free_blocks_.erase(0);
         free_blocks_.erase(1);
-        free_blocks_.erase(root_block_num_);
+        // Don't mark root_block here - let scan_used_blocks find it
         
         // Parse the actual bitmap
         const auto* root = get_block<RootBlock>(root_block_num_);
@@ -406,8 +421,17 @@ public:
             }
         }
         
-        // Also mark blocks used by directory structure
-        scan_used_blocks(root_block_num_);
+        // Also mark blocks used by directory structure: mark root as used,
+        // then walk every hash bucket so we don't short-circuit on "used root".
+        used_blocks_.insert(root_block_num_);
+        free_blocks_.erase(root_block_num_);
+        
+        const auto* root2 = get_block<RootBlock>(root_block_num_);
+        if (!root2) return;
+        for (int i = 0; i < HASH_TABLE_SIZE; ++i) {
+            uint32_t hb = endian::from_big_endian(root2->hash_table[i]);
+            if (hb) scan_used_blocks(hb);
+        }
     }
     
     void scan_used_blocks(uint32_t block_num) {
@@ -469,10 +493,25 @@ public:
         if (free_blocks_.empty()) return 0;
         
         uint32_t block = *free_blocks_.begin();
+        
+        // Precheck if bitmap update will succeed
+        uint32_t bitmap_index = block / 4064;
+        if (bitmap_index >= 25) return 0;  // Beyond supported range
+        
+        const auto* root = get_block<RootBlock>(root_block_num_);
+        if (!root) return 0;
+        
+        uint32_t bm_block = endian::from_big_endian(root->bm_pages[bitmap_index]);
+        if (bm_block == 0) {
+            // Cannot update bitmap - allocation would fail
+            return 0;
+        }
+        
+        // Safe to proceed - bitmap update will work
         free_blocks_.erase(block);
         used_blocks_.insert(block);
         
-        // Update bitmap
+        // Update bitmap (now guaranteed to succeed)
         update_bitmap_for_block(block, false); // false = mark as used
         
         // Clear the block
@@ -495,6 +534,9 @@ public:
     }
     
     void update_bitmap_for_block(uint32_t block, bool is_free) {
+        uint32_t total_blocks = static_cast<uint32_t>(file_size_ / BLOCK_SIZE);
+        if (block >= total_blocks) return;
+        
         // Find which bitmap block this belongs to
         uint32_t bitmap_index = block / 4064;
         uint32_t bit_offset = block % 4064;
@@ -508,8 +550,8 @@ public:
         
         uint32_t bm_block = endian::from_big_endian(root->bm_pages[bitmap_index]);
         if (bm_block == 0) {
-            // Need to allocate a new bitmap block - TODO
-            return;
+            // Disk full - no more bitmap space (bitmap extension not implemented)
+            return; // Skip allocation - caller should handle lack of free blocks
         }
         
         auto* bitmap = get_block_writable<BitmapBlock>(bm_block);
@@ -524,12 +566,12 @@ public:
         bitmap->map[word_index] = endian::to_big_endian(map_word);
         
         // Update bitmap checksum
-        update_checksum(bitmap);
+        update_bitmap_checksum(bitmap);
     }
     
     uint32_t hash_name(const std::string& name) {
         uint32_t hash = static_cast<uint32_t>(name.length());
-        for (char c : name) {
+        for (unsigned char c : name) {
             hash = hash * 13 + static_cast<uint32_t>(std::toupper(c));
         }
         return hash % HASH_TABLE_SIZE;
@@ -561,7 +603,10 @@ public:
                 
                 Entry entry;
                 entry.name = BcplString::read(block->filename);
-                if (entry.name.empty()) break;
+                if (entry.name.empty()) {
+                    block_num = endian::from_big_endian(block->hash_chain);
+                    continue;
+                }
                 
                 int32_t sec_type = endian::from_big_endian(block->sec_type);
                 entry.is_directory = (sec_type == ST_DIR);
@@ -611,61 +656,72 @@ public:
     }
     
     std::vector<uint8_t> read_file(uint32_t file_block_num, size_t offset, size_t size) {
-        if (file_block_num == 0) {
-            return {};
-        }
-        
+        if (!file_block_num) return {};
+
         const auto* file_block = get_block<FileBlock>(file_block_num);
         if (!file_block) return {};
-        
-        uint32_t file_size = endian::from_big_endian(file_block->file_size);
-        if (offset >= file_size) return {};
-        
-        size = std::min(size, file_size - offset);
-        std::vector<uint8_t> result;
-        result.reserve(size);
-        
-        uint32_t first_data_block = endian::from_big_endian(file_block->first_data);
-        if (first_data_block == 0) {
-            return {};
+
+        uint32_t fsize = endian::from_big_endian(file_block->file_size);
+        if (offset >= fsize) return {};
+
+        size = std::min<size_t>(size, fsize - offset);
+
+        std::vector<uint8_t> out(size);
+        uint32_t first = endian::from_big_endian(file_block->first_data);
+
+        size_t want_idx = offset / 488;
+        size_t pos_in_block = offset % 488;
+
+        uint32_t cur = first;
+        size_t cur_idx = 0;
+
+        // seek to starting logical block
+        while (cur && cur_idx < want_idx) {
+            const auto* db = get_block<DataBlock>(cur);
+            if (!db) { cur = 0; break; }
+            cur = endian::from_big_endian(db->next_data);
+            ++cur_idx;
         }
-        
-        uint32_t current_block = first_data_block;
-        size_t bytes_read = 0;
-        size_t current_offset = 0;
-        
-        while (current_block != 0 && bytes_read < size) {
-            const auto* data_block = get_block<DataBlock>(current_block);
-            if (!data_block) break;
-            
-            uint32_t data_size = endian::from_big_endian(data_block->data_size);
-            data_size = std::min(data_size, 488u);
-            
-            size_t block_start = 0;
-            size_t block_read_size = data_size;
-            
-            if (current_offset + data_size <= offset) {
-                current_offset += data_size;
-                current_block = endian::from_big_endian(data_block->next_data);
+
+        size_t produced = 0;
+        while (produced < size) {
+            if (!cur) {
+                // hole: zero-fill until end of this logical block
+                size_t can = std::min<size_t>(size - produced, 488 - pos_in_block);
+                std::memset(out.data() + produced, 0, can);
+                produced += can;
+                pos_in_block += can;
+                if (pos_in_block >= 488) { pos_in_block = 0; ++cur_idx; }
                 continue;
             }
-            
-            if (current_offset < offset) {
-                block_start = offset - current_offset;
-                block_read_size = data_size - block_start;
+
+            const auto* db = get_block<DataBlock>(cur);
+            if (!db) break;
+
+            uint32_t db_size = std::min<uint32_t>(488u, endian::from_big_endian(db->data_size));
+            size_t need = std::min<size_t>(size - produced, 488 - pos_in_block);
+
+            if (pos_in_block < db_size) {
+                size_t take = std::min<size_t>(need, db_size - pos_in_block);
+                std::memcpy(out.data() + produced, db->data + pos_in_block, take);
+                produced += take;
+                pos_in_block += take;
+                need -= take;
             }
-            
-            block_read_size = std::min(block_read_size, size - bytes_read);
-            
-            const uint8_t* block_data = data_block->data + block_start;
-            result.insert(result.end(), block_data, block_data + block_read_size);
-            
-            bytes_read += block_read_size;
-            current_offset += data_size;
-            current_block = endian::from_big_endian(data_block->next_data);
+            if (need) { // inside logical block but past data_size => zeros
+                std::memset(out.data() + produced, 0, need);
+                produced += need;
+                pos_in_block += need;
+            }
+
+            if (pos_in_block >= 488) {
+                pos_in_block = 0;
+                cur = endian::from_big_endian(db->next_data);
+                ++cur_idx;
+            }
         }
-        
-        return result;
+
+        return out;
     }
     
     int write_file(uint32_t file_block_num, const void* buf, size_t size, size_t offset) {
@@ -704,72 +760,129 @@ public:
             }
         }
         
-        // Navigate to correct data block and write
-        uint32_t current_block = first_data_block;
-        uint32_t prev_block = 0;
-        size_t current_offset = 0;
-        size_t bytes_written = 0;
+        // Navigate to target offset with proper sparse write handling
+        size_t target_offset = offset;
         const uint8_t* data = static_cast<const uint8_t*>(buf);
         
+        // Walk existing chain to find insertion point
+        uint32_t current_block = first_data_block;
+        uint32_t prev_block = 0;
+        size_t current_pos = 0;
+        
+        while (current_block != 0) {
+            const auto* data_block = get_block<DataBlock>(current_block);
+            if (!data_block) return -EIO;
+            
+            // If target offset is within this block range, break
+            if (current_pos + 488 > target_offset) break;
+            
+            // Always advance by 488 for offset addressing (not actual data_size)
+            current_pos += 488;
+            prev_block = current_block;
+            current_block = endian::from_big_endian(data_block->next_data);
+        }
+        
+        // Create zero-filled blocks to bridge any gaps
+        while (current_pos + 488 <= target_offset) {
+            uint32_t new_block = allocate_block();
+            if (new_block == 0) return -ENOSPC;
+            
+            auto* new_data = get_block_writable<DataBlock>(new_block);
+            if (!new_data) return -EIO;
+            
+            new_data->type = endian::to_big_endian(static_cast<uint32_t>(T_DATA));
+            new_data->header_key = endian::to_big_endian(file_block_num);
+            new_data->seq_num = endian::to_big_endian(static_cast<uint32_t>(current_pos / 488 + 1));
+            new_data->data_size = 0;
+            new_data->next_data = 0;
+            std::memset(new_data->data, 0, 488);
+            
+            // Link into chain
+            if (prev_block != 0) {
+                auto* prev_data = get_block_writable<DataBlock>(prev_block);
+                if (prev_data) {
+                    prev_data->next_data = endian::to_big_endian(new_block);
+                    update_checksum(prev_data);
+                }
+            } else {
+                file_block->first_data = endian::to_big_endian(new_block);
+                update_checksum(file_block);
+            }
+            
+            update_checksum(new_data);
+            prev_block = new_block;
+            current_block = new_block;
+            current_pos += 488;
+        }
+        
+        // Now write data starting at target_offset
+        size_t bytes_written = 0;
+        size_t write_pos = target_offset;
+        
         while (bytes_written < size) {
+            // Allocate new block if needed
             if (current_block == 0) {
-                // Need to allocate new data block
                 current_block = allocate_block();
-                if (current_block == 0) return bytes_written; // Partial write
+                if (current_block == 0) return bytes_written;
                 
-                // Link from previous block
+                auto* new_data = get_block_writable<DataBlock>(current_block);
+                if (!new_data) return -EIO;
+                
+                new_data->type = endian::to_big_endian(static_cast<uint32_t>(T_DATA));
+                new_data->header_key = endian::to_big_endian(file_block_num);
+                new_data->seq_num = endian::to_big_endian(static_cast<uint32_t>(current_pos / 488 + 1));
+                new_data->data_size = 0;
+                new_data->next_data = 0;
+                std::memset(new_data->data, 0, 488);
+                
                 if (prev_block != 0) {
                     auto* prev_data = get_block_writable<DataBlock>(prev_block);
                     if (prev_data) {
                         prev_data->next_data = endian::to_big_endian(current_block);
                         update_checksum(prev_data);
                     }
+                } else {
+                    file_block->first_data = endian::to_big_endian(current_block);
+                    update_checksum(file_block);
                 }
                 
-                // Initialize new data block
-                auto* new_data = get_block_writable<DataBlock>(current_block);
-                if (new_data) {
-                    new_data->type = endian::to_big_endian(static_cast<uint32_t>(T_DATA));
-                    new_data->header_key = endian::to_big_endian(file_block_num);
-                    new_data->seq_num = endian::to_big_endian(current_offset / 488 + 1);
-                    new_data->next_data = 0;
-                    new_data->data_size = 0;
-                }
+                update_checksum(new_data);
             }
             
             auto* data_block = get_block_writable<DataBlock>(current_block);
             if (!data_block) return -EIO;
             
-            uint32_t block_data_size = endian::from_big_endian(data_block->data_size);
-            
-            // Skip blocks until we reach the offset
-            if (current_offset + 488 <= offset) {
-                current_offset += 488;
-                prev_block = current_block;
-                current_block = endian::from_big_endian(data_block->next_data);
-                continue;
-            }
-            
-            // Calculate write position within this block
-            size_t block_offset = (current_offset < offset) ? (offset - current_offset) : 0;
+            // Calculate position within current block
+            size_t block_start = (current_pos / 488) * 488;
+            size_t block_offset = write_pos - block_start;
             size_t write_size = std::min(size - bytes_written, 488 - block_offset);
+            
+            if (block_offset >= 488) return -EIO;  // Safety check
             
             // Write data
             std::memcpy(data_block->data + block_offset, data + bytes_written, write_size);
             
-            // Update block size if needed
-            uint32_t new_block_size = block_offset + write_size;
-            if (new_block_size > block_data_size) {
-                data_block->data_size = endian::to_big_endian(new_block_size);
-            }
+            // Update block data size
+            uint32_t old_size = endian::from_big_endian(data_block->data_size);
+            uint32_t new_size = std::max(old_size, static_cast<uint32_t>(block_offset + write_size));
+            data_block->data_size = endian::to_big_endian(new_size);
             
             update_checksum(data_block);
             
             bytes_written += write_size;
-            current_offset += 488;
-            prev_block = current_block;
-            current_block = endian::from_big_endian(data_block->next_data);
+            write_pos += write_size;
+            
+            // Move to next block if this one is full
+            if (block_offset + write_size >= 488) {
+                prev_block = current_block;
+                current_block = endian::from_big_endian(data_block->next_data);
+                current_pos = ((current_pos / 488) + 1) * 488;
+            }
         }
+        
+        // Update file timestamps after successful write
+        touch_fileblock(file_block);
+        update_checksum(file_block);
         
         return bytes_written;
     }
@@ -904,19 +1017,29 @@ public:
                     data_block = next;
                 }
                 
-                // Update last block's next pointer
+                // Update last block's next pointer and data_size
                 if (prev_block != 0) {
                     auto* data = get_block_writable<DataBlock>(prev_block);
                     if (data) {
-                        data->next_data = 0;
+                        data->next_data = endian::to_big_endian(0u);
+                        // Set correct data_size for the truncated block
+                        uint32_t remainder = static_cast<uint32_t>(size % 488);
+                        if (remainder == 0 && size > 0) remainder = 488;
+                        data->data_size = endian::to_big_endian(remainder);
                         update_checksum(data);
                     }
+                } else if (size == 0) {
+                    // Truncated to zero - clear first_data
+                    file->first_data = endian::to_big_endian(0u);
                 }
             }
         }
         
         // Update file size
         file->file_size = endian::to_big_endian(static_cast<uint32_t>(size));
+        
+        // Update timestamp after truncation
+        touch_fileblock(file);
         update_checksum(file);
         
         return 0;
@@ -1010,6 +1133,12 @@ public:
         dir_cache_.clear();
     }
     
+    void sync_to_disk() {
+        if (mapped_data_ && !read_only_) {
+            msync(mapped_data_, file_size_, MS_SYNC);
+        }
+    }
+    
     size_t get_actual_file_size(uint32_t file_block_num) {
         const auto* file_block = get_block<FileBlock>(file_block_num);
         if (!file_block) return 0;
@@ -1060,6 +1189,7 @@ private:
                 update_checksum(file);
             }
             
+            touch_rootblock(root);
             update_checksum(root);
         } else {
             auto* dir = get_block_writable<FileBlock>(dir_block);
@@ -1075,6 +1205,7 @@ private:
                 update_checksum(file);
             }
             
+            touch_fileblock(dir);
             update_checksum(dir);
         }
     }
@@ -1090,11 +1221,15 @@ private:
             if (current == file_block) {
                 // First in chain
                 auto* file = get_block<FileBlock>(file_block);
-                root->hash_table[hash] = file ? file->hash_chain : 0;
+                root->hash_table[hash] = file ? endian::to_big_endian(endian::from_big_endian(file->hash_chain)) : 0;
+                touch_rootblock(root);
                 update_checksum(root);
             } else {
                 // Search chain
-                remove_from_chain(current, file_block);
+                if (remove_from_chain(current, file_block)) {
+                    touch_rootblock(root);
+                    update_checksum(root);
+                }
             }
         } else {
             auto* dir = get_block_writable<FileBlock>(dir_block);
@@ -1104,16 +1239,20 @@ private:
             if (current == file_block) {
                 // First in chain
                 auto* file = get_block<FileBlock>(file_block);
-                dir->data_blocks[hash] = file ? file->hash_chain : 0;
+                dir->data_blocks[hash] = file ? endian::to_big_endian(endian::from_big_endian(file->hash_chain)) : 0;
+                touch_fileblock(dir);
                 update_checksum(dir);
             } else {
                 // Search chain
-                remove_from_chain(current, file_block);
+                if (remove_from_chain(current, file_block)) {
+                    touch_fileblock(dir);
+                    update_checksum(dir);
+                }
             }
         }
     }
     
-    void remove_from_chain(uint32_t start_block, uint32_t target_block) {
+    bool remove_from_chain(uint32_t start_block, uint32_t target_block) {
         uint32_t current = start_block;
         
         while (current != 0) {
@@ -1122,15 +1261,19 @@ private:
             
             uint32_t next = endian::from_big_endian(block->hash_chain);
             if (next == target_block) {
-                // Found it - unlink
-                auto* target = get_block<FileBlock>(target_block);
-                block->hash_chain = target ? target->hash_chain : 0;
+                // Found it - unlink with proper endian conversion
+                uint32_t next2 = 0;
+                if (auto* target = get_block<FileBlock>(target_block)) {
+                    next2 = endian::from_big_endian(target->hash_chain);
+                }
+                block->hash_chain = endian::to_big_endian(next2);
                 update_checksum(block);
-                break;
+                return true;
             }
             
             current = next;
         }
+        return false;
     }
     
     time_t amiga_to_unix_time(uint32_t days, uint32_t mins, uint32_t ticks) {
@@ -1160,6 +1303,20 @@ private:
         uint32_t ticks = amiga_time * 50; // 50 ticks per second
         
         return {days, mins, ticks};
+    }
+    
+    void touch_fileblock(FileBlock* fb, time_t t = time(nullptr)) {
+        auto [d, m, ticks] = unix_to_amiga_time(t);
+        fb->days  = endian::to_big_endian(d);
+        fb->mins  = endian::to_big_endian(m);
+        fb->ticks = endian::to_big_endian(ticks);
+    }
+    
+    void touch_rootblock(RootBlock* rb, time_t t = time(nullptr)) {
+        auto [d, m, ticks] = unix_to_amiga_time(t);
+        rb->days  = endian::to_big_endian(d);
+        rb->mins  = endian::to_big_endian(m);
+        rb->ticks = endian::to_big_endian(ticks);
     }
 };
 
@@ -1210,30 +1367,29 @@ static int getattr(const char* path, struct stat* stbuf) {
 static int readdir(const char* path, void* buf, fuse_fill_dir_t filler,
                    off_t, struct fuse_file_info*) {
     if (!g_adf_image) return -EIO;
-    
+
     auto entries = g_adf_image->list_directory(path);
     if (!entries) return -ENOENT;
-    
-    if (filler(buf, ".", nullptr, 0) || filler(buf, "..", nullptr, 0)) {
-        return -ENOMEM;
-    }
-    
+
+    if (filler(buf, ".",  nullptr, 0) != 0) return 0;
+    if (filler(buf, "..", nullptr, 0) != 0) return 0;
+
     for (const auto& entry : *entries) {
-        if (filler(buf, entry.name.c_str(), nullptr, 0)) {
-            break;
-        }
+        if (filler(buf, entry.name.c_str(), nullptr, 0) != 0) break;
     }
-    
     return 0;
 }
 
 static int open(const char* path, struct fuse_file_info* fi) {
     if (!g_adf_image) return -EIO;
-    
+
     auto entry = g_adf_image->get_entry(path);
     if (!entry) return -ENOENT;
     if (entry->is_directory) return -EISDIR;
-    
+
+    if (g_adf_image->is_read_only() && (fi->flags & O_ACCMODE) != O_RDONLY)
+        return -EROFS;
+
     fi->fh = entry->block_num;
     return 0;
 }
@@ -1315,21 +1471,35 @@ static int rmdir(const char* path) {
     return g_adf_image->delete_directory(path);
 }
 
+static int fsync(const char*, int, struct fuse_file_info*) {
+    if (g_adf_image) g_adf_image->sync_to_disk();
+    return 0;
+}
+
+static int flush(const char*, struct fuse_file_info*) {
+    if (g_adf_image) g_adf_image->sync_to_disk();
+    return 0;
+}
+
 } // namespace fuse_ops
 
 // FUSE operations structure with write support
-static struct fuse_operations amiga_fuse_operations = {
-    .getattr = fuse_ops::getattr,
-    .readdir = fuse_ops::readdir,
-    .open = fuse_ops::open,
-    .read = fuse_ops::read,
-    .write = fuse_ops::write,
-    .create = fuse_ops::create,
-    .unlink = fuse_ops::unlink,
-    .truncate = fuse_ops::truncate,
-    .mkdir = fuse_ops::mkdir,
-    .rmdir = fuse_ops::rmdir,
-};
+static struct fuse_operations amiga_fuse_operations = {};
+
+void initialize_fuse_operations() {
+    amiga_fuse_operations.getattr = fuse_ops::getattr;
+    amiga_fuse_operations.readdir = fuse_ops::readdir;
+    amiga_fuse_operations.open = fuse_ops::open;
+    amiga_fuse_operations.read = fuse_ops::read;
+    amiga_fuse_operations.write = fuse_ops::write;
+    amiga_fuse_operations.create = fuse_ops::create;
+    amiga_fuse_operations.unlink = fuse_ops::unlink;
+    amiga_fuse_operations.truncate = fuse_ops::truncate;
+    amiga_fuse_operations.mkdir = fuse_ops::mkdir;
+    amiga_fuse_operations.rmdir = fuse_ops::rmdir;
+    amiga_fuse_operations.flush = fuse_ops::flush;
+    amiga_fuse_operations.fsync = fuse_ops::fsync;
+}
 
 } // namespace amiga_fuse
 
@@ -1357,6 +1527,9 @@ int main(int argc, char* argv[]) {
         std::cout << " [READ-WRITE]";
     }
     std::cout << "\n";
+    
+    // Initialize FUSE operations structure
+    initialize_fuse_operations();
     
     // Adjust arguments for FUSE
     argv[1] = argv[2];

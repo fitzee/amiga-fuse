@@ -1,6 +1,6 @@
 # amiga-fuse
 
-Ever wanted to mount your old Amiga ADF disk images on your Mac or Linux box and actually edit them? Yeah, me too! I got tired of not being able to easily work with my Amiga disk images on modern systems, so I wrote this FUSE driver to solve that problem once and for all.
+Ever wanted to mount your old Amiga ADF disk images on your Mac or Linux box and actually edit them? Yeah, me too! I got tired of not being able to easily work with my Amiga disk images on modern systems, so I had an AI assistant help me create this FUSE driver to solve that problem once and for all.
 
 This lets you mount ADF files just like any other disk - you can browse them, edit files, create new ones, whatever you need. No more messing around with emulators just to copy a file or two.
 
@@ -101,7 +101,7 @@ The code handles all the weird Amiga filesystem details automatically - block al
 
 ## The nerdy details
 
-Right now this handles standard 880K floppy ADFs with both OFS and FFS filesystems. I wrote it in C++23 because why not use modern stuff, and it's optimized to be small and fast. The binary comes out to about 68KB which is pretty decent.
+Right now this handles standard 880K floppy ADFs with both OFS and FFS filesystems. It's written in C++23 (because why not use modern stuff), and it's optimized to be small and fast. The binary comes out to about 52KB which is pretty decent.
 
 Internally it uses memory-mapped I/O and caches directory info to keep things snappy. All the endian conversion and Amiga-specific quirks are handled transparently.
 
@@ -139,6 +139,10 @@ Maybe Windows support eventually, but honestly FUSE on Windows is kind of a mess
 ## License
 
 Do whatever you want with this code. I just wanted to mount my old Amiga disks without jumping through hoops.
+
+## Acknowledgments
+
+This implementation was developed with substantial assistance from Claude, an AI assistant. The core algorithms, structural fixes, and optimizations were implemented through iterative AI-assisted development.
 
 ---
 
